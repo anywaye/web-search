@@ -1,15 +1,14 @@
-
 from fastmcp import FastMCP
 from mcp_prism_search.fetch import web_fetch as perform_web_fetch, ddg_deep_search as perform_deep_search
 from mcp_prism_search.search import aggregated_search as perform_aggregated_search
 from mcp_prism_search.cache import get_cache_stats as _cache_stats, prune_cache as _prune, clear_cache as _clear
+from mcp_prism_search.providers import available_providers
 from mcp_prism_search.injection import sanitize, wrap
 
 mcp = FastMCP("web-search", version="0.1.0")
 
 @mcp.tool()
-async def web_search(query: str, provider: str = "auto", max_results: int = 10, safe_search: str = "off", time_filter: str | None = None, search_window: int | None = None, blocked_domains: list[str] | None = None, allowed_domains: list[str] | None = None, preferred_domains: list[str] | None = None):
-    from mcp_prism_search.providers import available_providers
+async def web_search(query, provider="auto", max_results=10, safe_search="off", time_filter=None, search_window=None, blocked_domains=None, allowed_domains=None, preferred_domains=None):
     available = sorted(available_providers("general"))
     response = await perform_aggregated_search(
         query=query,
@@ -29,7 +28,7 @@ async def web_search(query: str, provider: str = "auto", max_results: int = 10, 
     return response.model_dump(mode="json")
 
 @mcp.tool()
-async def web_fetch(url: str, max_chars: int = 12000):
+async def web_fetch(url, max_chars=12000):
     response = await perform_web_fetch(url=url, max_chars=max_chars)
     if not response.success:
         raise ValueError(response.error or "Fetch failed")
