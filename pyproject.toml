@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mcp-prism-search"
-version = "0.13.0"
+name = "anywaye-web-search"
+version = "0.1.0"
 description = "MCP search aggregator: multi-provider keyless web search (Bing, DuckDuckGo, SearXNG, 4get, FreeSerp, Keenable, Mwmbl) with keyed free-tier providers (Tavily, Exa, Brave, You.com, Serper, Jina), fallback chains, deterministic ranking, caching, and SSRF-safe fetching."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -20,6 +20,10 @@ dependencies = [
   "mcp>=2.2,<3",
   "pydantic>=2.7",
 ]
+
+[project.scripts]
+web-search = "mcp_prism_search.fastmcp_entry:main"
+web-search-mcp = "mcp_prism_search.fastmcp_entry:main"
 
 [project.optional-dependencies]
 dev = [

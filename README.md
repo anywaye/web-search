@@ -1,4 +1,4 @@
-# mcp-prism-search
+# web-search
 
 MCP search aggregator: one query, refracted across many keyless search engines.
 

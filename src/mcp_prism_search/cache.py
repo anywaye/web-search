@@ -15,7 +15,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-DEFAULT_CACHE_DIR = "/data/cache"
+DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/web-search")
 DEFAULT_SEARCH_TTL_SECONDS = 21_600
 DEFAULT_FETCH_TTL_SECONDS = 7_200
 DEFAULT_CACHE_PRUNE_INTERVAL_SECONDS = 3_600

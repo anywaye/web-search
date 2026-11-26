@@ -35,6 +35,7 @@ from mcp_prism_search.models import (
 from mcp_prism_search.providers import available_providers
 from mcp_prism_search.search import aggregated_search as perform_aggregated_search
 from mcp_prism_search.search import ddg_search as perform_ddg_search
+from mcp_prism_search.injection import sanitize, wrap
 
 LOGGER = logging.getLogger(__name__)
 
@@ -73,8 +74,8 @@ def _validated_log_level() -> str:
 
 
 mcp = MCPServer(
-    name="mcp-prism-search",
-    version="0.6.0",
+    name="web-search",
+    version="0.1.0",
     instructions=(
         "Deterministic DuckDuckGo search and safe webpage fetching tools. "
         "This server does not call LLMs, summarize, or generate reports."
@@ -336,6 +337,9 @@ async def web_search(
         preferred_domains=preferred_domains,
         kind="general",
     )
+    for r in response.results:
+        r.title, _ = sanitize(r.title)
+        r.snippet, _ = sanitize(r.snippet)
     return response.model_dump(mode="json")
 
 
@@ -430,10 +434,16 @@ async def web_fetch(
 ) -> FetchResponse:
     """Fetch one HTTP(S) page safely and return extracted text."""
 
-    response = await perform_web_fetch(url=url, max_chars=max_chars)
-    if not response.success:
-        raise ToolError(response.error or "Fetch failed")
-    return response
+    try:
+        response = await perform_web_fetch(url=url, max_chars=max_chars)
+        if not response.success:
+            raise ToolError(response.error or "Fetch failed")
+        sanitized, _warnings = sanitize(response.content)
+        response.content = wrap(response.final_url or url, sanitized)
+        return response.model_dump(mode="json")
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise
 
 
 @mcp.tool(annotations=_tool_annotations(read_only=True))
