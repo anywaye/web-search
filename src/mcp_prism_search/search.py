@@ -1,0 +1,623 @@
+"""DuckDuckGo-focused search with optional ddgs provider support."""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+import inspect
+import logging
+import os
+import re
+from typing import Any, cast
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
+
+import httpx
+from bs4 import BeautifulSoup
+
+from mcp_prism_search.cache import JsonFileCache, build_search_cache, get_env_int
+from mcp_prism_search.domains import apply_domain_controls
+from mcp_prism_search.models import (
+    SearchProvider,
+    SearchRequest,
+    SearchResponse,
+    SearchResult,
+)
+from mcp_prism_search.text import normalize_whitespace
+
+DUCKDUCKGO_HTML_URL = "https://html.duckduckgo.com/html/"
+DDGS_SAFE_SEARCH = {"off": "off", "moderate": "moderate", "strict": "on"}
+HTML_SAFE_SEARCH = {"off": "-2", "moderate": "-1", "strict": "1"}
+TIME_FILTERS = {"day": "d", "week": "w", "month": "m", "year": "y"}
+DEFAULT_SEARCH_PROVIDER = "duckduckgo_html"
+DEFAULT_DDGS_BACKEND = "duckduckgo"
+SEARCH_PROVIDERS = {"duckduckgo_html", "ddgs", "auto"}
+DEFAULT_DDG_TIMEOUT_SECONDS = 15
+DEFAULT_DOMAIN_CONTROL_WINDOW_MULTIPLIER = 3
+DEFAULT_DOMAIN_CONTROL_WINDOW_CAP = 50
+LOGGER = logging.getLogger(__name__)
+SEARCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def get_ddg_timeout_seconds() -> int:
+    return get_env_int("DDG_TIMEOUT_SECONDS", DEFAULT_DDG_TIMEOUT_SECONDS)
+
+
+def get_search_provider() -> str:
+    provider = os.getenv("SEARCH_PROVIDER", DEFAULT_SEARCH_PROVIDER).strip().lower()
+    if provider in SEARCH_PROVIDERS:
+        return provider
+    LOGGER.warning(
+        "Invalid SEARCH_PROVIDER=%r; falling back to %s",
+        provider,
+        DEFAULT_SEARCH_PROVIDER,
+    )
+    return DEFAULT_SEARCH_PROVIDER
+
+
+def is_valid_search_provider(provider: str) -> bool:
+    return provider.strip().lower() in SEARCH_PROVIDERS
+
+
+def _available_ddgs_text_backends() -> set[str] | None:
+    try:
+        ddgs_module = importlib.import_module("ddgs.ddgs")
+    except Exception:  # noqa: BLE001 - ddgs is optional at runtime unless selected.
+        return None
+
+    engines = getattr(ddgs_module, "ENGINES", None)
+    if not isinstance(engines, dict):
+        return None
+    text_engines = engines.get("text")
+    if not isinstance(text_engines, dict):
+        return None
+    return {str(backend).lower() for backend in text_engines}
+
+
+def get_ddgs_backend() -> str:
+    backend = os.getenv("DDGS_BACKEND", DEFAULT_DDGS_BACKEND).strip().lower()
+    if not backend:
+        return DEFAULT_DDGS_BACKEND
+    if backend == "auto":
+        return backend
+
+    requested_backends = [part.strip() for part in backend.split(",") if part.strip()]
+    if not requested_backends:
+        return DEFAULT_DDGS_BACKEND
+
+    available_backends = _available_ddgs_text_backends()
+    if available_backends is None:
+        return ",".join(requested_backends)
+
+    invalid_backends = [
+        requested_backend
+        for requested_backend in requested_backends
+        if requested_backend not in available_backends
+    ]
+    if invalid_backends:
+        LOGGER.warning(
+            "Invalid DDGS_BACKEND=%r; falling back to %s",
+            backend,
+            DEFAULT_DDGS_BACKEND,
+        )
+        return DEFAULT_DDGS_BACKEND
+    return ",".join(requested_backends)
+
+
+def has_domain_controls(request: SearchRequest) -> bool:
+    return bool(
+        request.allowed_domains
+        or request.blocked_domains
+        or request.preferred_domains
+    )
+
+
+NEWS_HINT_TOKENS = {
+    "news", "latest", "breaking", "today", "current", "updates", "happening",
+}
+NEWS_SEARCH_TTL_SECONDS = 1800
+_TRUSTED_DOMAINS = {
+    "apnews.com", "reuters.com", "bbc.com", "bbc.co.uk", "theguardian.com",
+    "nytimes.com", "washingtonpost.com", "dw.com", "euronews.com",
+    "wikipedia.org",
+}
+
+
+def search_ttl_for_query(query: str) -> int | None:
+    """Shorter cache TTL for freshness-looking queries (news-style tokens).
+
+    Returns None to use the cache instance default TTL.
+    """
+    tokens = set(re.findall(r"\w+", query.lower()))
+    if tokens & NEWS_HINT_TOKENS:
+        return NEWS_SEARCH_TTL_SECONDS
+    return None
+
+
+def _trusted_domain_score(hostname: str) -> float:
+    if hostname.endswith(".gov") or hostname.endswith(".edu"):
+        return 1.0
+    if hostname == "wikipedia.org" or hostname.endswith(".wikipedia.org"):
+        return 0.9
+    if hostname.endswith(".org"):
+        return 0.7
+    return 0.4
+
+
+def rank_results(results: list[SearchResult], query: str) -> list[SearchResult]:
+    """Stable deterministic ranking: title/snippet term coverage plus domain
+    trust. No ML, no external services."""
+    terms = {token for token in re.findall(r"\w+", query.lower()) if len(token) >= 2}
+
+    def score(result: SearchResult) -> float:
+        title_tokens = set(re.findall(r"\w+", result.title.lower()))
+        snippet_tokens = set(re.findall(r"\w+", result.snippet.lower()))
+        title_score = len(title_tokens & terms) / len(terms) if terms else 0.0
+        snippet_score = len(snippet_tokens & terms) / len(terms) if terms else 0.0
+        hostname = urlparse(result.url).hostname or ""
+        return 2.0 * title_score + 1.0 * snippet_score + 1.5 * _trusted_domain_score(hostname)
+
+    return sorted(results, key=score, reverse=True)
+
+
+def provider_request_size(request: SearchRequest) -> int:
+    if request.search_window is not None:
+        return request.search_window
+    if has_domain_controls(request):
+        return min(
+            request.max_results * DEFAULT_DOMAIN_CONTROL_WINDOW_MULTIPLIER,
+            DEFAULT_DOMAIN_CONTROL_WINDOW_CAP,
+        )
+    return request.max_results
+
+
+def resolve_duckduckgo_redirect_url(href: str) -> str:
+    if href.startswith("//"):
+        resolved = f"https:{href}"
+    elif href.startswith("/"):
+        resolved = urljoin(DUCKDUCKGO_HTML_URL, href)
+    else:
+        resolved = href
+
+    parsed = urlparse(resolved)
+    hostname = parsed.hostname.lower() if parsed.hostname else ""
+    is_duckduckgo_host = hostname == "duckduckgo.com" or hostname.endswith(".duckduckgo.com")
+    if is_duckduckgo_host and parsed.path.rstrip("/") == "/l":
+        redirect_values = parse_qs(parsed.query).get("uddg")
+        if redirect_values and redirect_values[0]:
+            return redirect_values[0]
+    return resolved
+
+
+def normalize_url_for_dedupe(url: str) -> str:
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    path = parsed.path or ""
+    if path == "/" and not parsed.query:
+        path = ""
+    query = urlencode(sorted(parse_qs(parsed.query, keep_blank_values=True).items()), doseq=True)
+    return urlunparse((scheme, netloc, path, "", query, ""))
+
+
+def _result_from_payload(payload: dict[str, Any]) -> SearchResult | None:
+    title = normalize_whitespace(str(payload.get("title") or ""))
+    url = str(payload.get("href") or payload.get("url") or "")
+    snippet = normalize_whitespace(str(payload.get("body") or payload.get("snippet") or ""))
+    if not title or not url:
+        return None
+    return SearchResult(title=title, url=resolve_duckduckgo_redirect_url(url), snippet=snippet)
+
+
+def _dedupe_results(
+    results: list[SearchResult],
+    max_results: int | None = None,
+) -> list[SearchResult]:
+    seen: set[str] = set()
+    deduped: list[SearchResult] = []
+    for result in results:
+        normalized_url = normalize_url_for_dedupe(result.url)
+        if normalized_url in seen:
+            continue
+        seen.add(normalized_url)
+        deduped.append(result)
+        if max_results is not None and len(deduped) >= max_results:
+            break
+    return deduped
+
+
+def _signature_accepts_parameter(signature: inspect.Signature, parameter_name: str) -> bool:
+    return parameter_name in signature.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
+def _ddgs_text_kwargs(
+    request: SearchRequest,
+    backend: str,
+    *,
+    include_backend: bool,
+) -> dict[str, Any]:
+    timelimit = TIME_FILTERS.get(request.time_filter) if request.time_filter else None
+    kwargs: dict[str, Any] = {
+        "max_results": provider_request_size(request),
+        "timelimit": timelimit,
+        "safesearch": DDGS_SAFE_SEARCH[request.safe_search],
+    }
+    if include_backend:
+        kwargs["backend"] = backend
+    return kwargs
+
+
+def _search_with_ddgs(
+    request: SearchRequest,
+    timeout_seconds: int,
+    backend: str = DEFAULT_DDGS_BACKEND,
+) -> list[SearchResult]:
+    from ddgs import DDGS
+
+    with DDGS(timeout=timeout_seconds) as ddgs:
+        text_signature = inspect.signature(ddgs.text)
+        include_backend = _signature_accepts_parameter(text_signature, "backend")
+        kwargs = _ddgs_text_kwargs(request, backend, include_backend=include_backend)
+        LOGGER.debug(
+            "Running ddgs search with backend=%s",
+            backend if include_backend else "unsupported",
+        )
+        try:
+            raw_results = ddgs.text(request.query, **kwargs)
+        except TypeError as exc:
+            if include_backend and "backend" in str(exc):
+                kwargs.pop("backend", None)
+                LOGGER.debug("Retrying ddgs search without backend parameter")
+                raw_results = ddgs.text(request.query, **kwargs)
+            else:
+                raise
+    results = [_result_from_payload(result) for result in raw_results or []]
+    valid_results = [result for result in results if result is not None]
+    return _dedupe_results(valid_results)
+
+
+def parse_duckduckgo_html_results(html: str, max_results: int) -> list[SearchResult]:
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[SearchResult] = []
+    for result_node in soup.select(".result"):
+        link = result_node.select_one(".result__a")
+        if link is None:
+            continue
+        href = link.get("href")
+        title = normalize_whitespace(link.get_text(" ", strip=True))
+        if not href or not title:
+            continue
+
+        snippet_node = result_node.select_one(".result__snippet")
+        snippet = (
+            normalize_whitespace(snippet_node.get_text(" ", strip=True)) if snippet_node else ""
+        )
+        results.append(
+            SearchResult(
+                title=title,
+                url=resolve_duckduckgo_redirect_url(str(href)),
+                snippet=snippet,
+            )
+        )
+    return _dedupe_results(results, max_results)
+
+
+async def _search_with_duckduckgo_html(
+    request: SearchRequest,
+    timeout_seconds: int,
+) -> list[SearchResult]:
+    params: dict[str, str | int] = {
+        "q": request.query,
+        "kp": HTML_SAFE_SEARCH[request.safe_search],
+    }
+    time_filter_code = TIME_FILTERS.get(request.time_filter or "")
+    if time_filter_code:
+        params["df"] = time_filter_code
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout_seconds),
+        follow_redirects=False,
+        headers=SEARCH_HEADERS,
+    ) as client:
+        response = await client.get(DUCKDUCKGO_HTML_URL, params=params)
+        response.raise_for_status()
+    return parse_duckduckgo_html_results(response.text, provider_request_size(request))
+
+
+def _cache_payload(
+    request: SearchRequest,
+    *,
+    provider: str,
+    ddgs_backend: str | None,
+) -> dict[str, Any]:
+    return request.to_cache_payload(_provider=provider, _ddgs_backend=ddgs_backend)
+
+
+def _cacheable_search_response(response: SearchResponse) -> dict[str, Any]:
+    return response.model_copy(update={"cached": False}).model_dump(mode="json")
+
+
+def apply_search_domain_controls(
+    results: list[SearchResult],
+    request: SearchRequest,
+) -> list[SearchResult]:
+    filtered_results = apply_domain_controls(
+        results,
+        get_url=lambda result: result.url,
+        allowed_domains=request.allowed_domains,
+        blocked_domains=request.blocked_domains,
+        preferred_domains=request.preferred_domains,
+    )
+    return filtered_results[: request.max_results]
+
+
+async def ddg_search(
+    query: str,
+    max_results: int = 10,
+    search_window: int | None = None,
+    safe_search: str = "off",
+    time_filter: str | None = None,
+    blocked_domains: list[str] | None = None,
+    allowed_domains: list[str] | None = None,
+    preferred_domains: list[str] | None = None,
+    *,
+    cache: JsonFileCache | None = None,
+) -> SearchResponse:
+    request = SearchRequest(
+        query=query,
+        max_results=max_results,
+        search_window=search_window,
+        safe_search=safe_search,
+        time_filter=time_filter,
+        blocked_domains=blocked_domains or [],
+        allowed_domains=allowed_domains or [],
+        preferred_domains=preferred_domains or [],
+    )
+    cache = cache or build_search_cache()
+    provider = cast(SearchProvider, get_search_provider())
+    ddgs_backend = get_ddgs_backend() if provider in {"ddgs", "auto"} else None
+    payload = _cache_payload(request, provider=provider, ddgs_backend=ddgs_backend)
+    cached_value = cache.get(payload, ttl_seconds=search_ttl_for_query(request.query))
+    if cached_value is not None:
+        try:
+            return SearchResponse.model_validate(cached_value).model_copy(
+                update={"cached": True}
+            )
+        except Exception:  # noqa: BLE001 - poisoned/stale cache must not break the tool.
+            cache.delete(payload)
+
+    timeout_seconds = get_ddg_timeout_seconds()
+    provider_errors: list[str] = []
+    provider_attempts: list[str] = []
+
+    if provider in {"duckduckgo_html", "auto"}:
+        try:
+            LOGGER.debug("Running DuckDuckGo HTML search")
+            html_results = apply_search_domain_controls(
+                await _search_with_duckduckgo_html(request, timeout_seconds),
+                request,
+            )
+            if html_results:
+                response = SearchResponse(
+                    query=request.query,
+                    provider="duckduckgo_html",
+                    results=rank_results(html_results, request.query),
+                    cached=False,
+                    error=None,
+                    provider_attempts=[f"duckduckgo_html: ok ({len(html_results)})"],
+                )
+                cache.set(payload, _cacheable_search_response(response))
+                return response
+            provider_attempts.append("duckduckgo_html: empty")
+            provider_errors.append("duckduckgo_html returned no results")
+        except Exception as exc:  # noqa: BLE001 - provider failures must not crash the server.
+            provider_attempts.append("duckduckgo_html: error")
+            provider_errors.append(f"duckduckgo_html failed: {exc}")
+
+    if provider in {"ddgs", "auto"}:
+        backend = ddgs_backend or DEFAULT_DDGS_BACKEND
+        try:
+            ddgs_results = apply_search_domain_controls(
+                await asyncio.to_thread(_search_with_ddgs, request, timeout_seconds, backend),
+                request,
+            )
+            if ddgs_results:
+                response = SearchResponse(
+                    query=request.query,
+                    provider="ddgs",
+                    results=rank_results(ddgs_results, request.query),
+                    cached=False,
+                    error=None,
+                    provider_attempts=[
+                        *provider_attempts,
+                        f"ddgs ({backend}): ok ({len(ddgs_results)})",
+                    ],
+                )
+                cache.set(payload, _cacheable_search_response(response))
+                return response
+            provider_attempts.append(f"ddgs ({backend}): empty")
+            provider_errors.append(f"ddgs backend {backend} returned no results")
+        except Exception as exc:  # noqa: BLE001 - provider failures must not crash the server.
+            provider_attempts.append(f"ddgs ({backend}): error")
+            provider_errors.append(f"ddgs backend {backend} failed: {exc}")
+
+    return SearchResponse(
+        query=request.query,
+        provider=provider,
+        results=[],
+        cached=False,
+        error="; ".join(provider_errors) or "Search failed",
+        provider_attempts=provider_attempts,
+    )
+
+
+async def _aggregate_all(
+    chain: list[str],
+    request: SearchRequest,
+    timeout_seconds: int,
+    cache: JsonFileCache | None,
+) -> SearchResponse:
+    """Fan out to every provider in the chain concurrently and merge results.
+
+    Round-robin interleaving preserves per-provider diversity; dedupe by
+    normalized URL drops repeats. At least one provider must return results
+    for the call to be considered a success.
+    """
+    import asyncio
+
+    from mcp_prism_search.providers import run_provider
+
+    window = max(request.max_results, request.search_window or 0) or request.max_results
+    tasks = {
+        name: asyncio.ensure_future(run_provider(name, request, window, timeout_seconds))
+        for name in chain
+    }
+
+    per_provider: dict[str, list[SearchResult]] = {}
+    errors: list[str] = []
+    done_set: set = set()
+    pending = set(tasks.values())
+    while pending:
+        done_set, pending = await asyncio.wait(pending, timeout=timeout_seconds)
+        for task in done_set:
+            name = next(n for n, t in tasks.items() if t is task)
+            try:
+                per_provider[name] = task.result()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{name}: error: {exc}")
+                per_provider[name] = []
+    # tasks that never completed within the timeout
+    for name, task in tasks.items():
+        if task not in done_set and not task.done():
+            task.cancel()
+            per_provider[name] = []
+            errors.append(f"{name}: timeout")
+
+    attempts = []
+    for name in chain:
+        if name in per_provider:
+            attempts.append(f"{name}: ok ({len(per_provider[name])})")
+        elif any(name in error for error in errors):
+            attempts.append(f"{name}: error")
+        else:
+            attempts.append(f"{name}: empty")
+    for error in errors:
+        attempts.append(error)
+
+    merged: list[SearchResult] = []
+    seen: set[str] = set()
+    max_len = max((len(v) for v in per_provider.values()), default=0)
+    for index in range(max_len):
+        for name in chain:
+            provider_results = per_provider.get(name) or []
+            if index < len(provider_results):
+                item = provider_results[index]
+                key = item.url.rstrip("/").lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+
+    return SearchResponse(
+        query=request.query,
+        provider="all",
+        results=merged[: request.max_results],
+        cached=False,
+        error=None if merged else ("; ".join(errors) or "All providers returned no results"),
+        provider_attempts=attempts,
+    )
+
+
+async def aggregated_search(
+    query: str,
+    *,
+    provider: str = "auto",
+    max_results: int = 10,
+    search_window: int | None = None,
+    safe_search: str = "off",
+    time_filter: str | None = None,
+    blocked_domains: list[str] | None = None,
+    allowed_domains: list[str] | None = None,
+    preferred_domains: list[str] | None = None,
+    kind: str = "general",
+    cache: JsonFileCache | None = None,
+) -> SearchResponse:
+    """Aggregate across providers: fallback chain + ranking + tally."""
+    from mcp_prism_search.providers import record, resolve_chain, run_provider
+
+    request = SearchRequest(
+        query=query,
+        max_results=max_results,
+        search_window=search_window,
+        safe_search=safe_search,
+        time_filter=time_filter,
+        blocked_domains=blocked_domains or [],
+        allowed_domains=allowed_domains or [],
+        preferred_domains=preferred_domains or [],
+    )
+    cache = cache or build_search_cache()
+    attempts: list[str] = []
+
+    try:
+        chain = resolve_chain(provider, kind)
+    except Exception as exc:  # noqa: BLE001 - unknown provider is a clean error.
+        return SearchResponse(
+            query=request.query,
+            provider=provider,
+            results=[],
+            cached=False,
+            error=str(exc),
+        )
+
+    if not chain:
+        return SearchResponse(
+            query=request.query,
+            provider=provider,
+            results=[],
+            cached=False,
+            error="No search providers configured for this environment",
+        )
+
+    timeout_seconds = get_ddg_timeout_seconds()
+
+    if provider == "all":
+        return await _aggregate_all(chain, request, timeout_seconds, cache)
+
+    for name in chain:
+        count = max(request.max_results, request.search_window or 0) or request.max_results
+        try:
+            results = await run_provider(name, request, count, timeout_seconds)
+        except Exception as exc:  # noqa: BLE001 - provider failures must not crash the server.
+            attempts.append(f"{name}: error: {exc}")
+            continue
+        record(name, results, None)
+        if results:
+            attempts.append(f"{name}: ok ({len(results)})")
+            return SearchResponse(
+                query=request.query,
+                provider=provider,
+                results=results[: request.max_results],
+                cached=False,
+                error=None,
+                provider_attempts=attempts,
+            )
+        attempts.append(f"{name}: empty")
+
+    record(provider, None, "all failed")
+    return SearchResponse(
+        query=request.query,
+        provider=provider,
+        results=[],
+        cached=False,
+        error="; ".join(attempts) or "All search providers failed",
+        provider_attempts=attempts,
+    )

@@ -1,0 +1,57 @@
+services:
+  ddg-research:
+    build: .
+    image: mcp-prism-search:local
+    container_name: mcp-prism-search
+    restart: unless-stopped
+    ports:
+      # Loopback only by default; the MCP_AUTH_TOKEN below gates the service.
+      - "127.0.0.1:49317:8000"
+    volumes:
+      # The container runs as uid 10001:10001. On first run, make the bind
+      # mount writable by that uid:
+      #   mkdir -p ~/docker/docker-data/mcp-prism-search
+      #   sudo chown -R 10001:10001 ~/docker/docker-data/mcp-prism-search
+      - ~/docker/docker-data/mcp-prism-search:/data
+    environment:
+      # Required for Docker/LAN HTTP mode. The image defaults to stdio, so
+      # compose explicitly enables streamable HTTP and binds inside the container.
+      MCP_TRANSPORT: http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+
+      # DuckDuckGo-only search defaults. ddgs can be enabled explicitly; see README.
+      SEARCH_PROVIDER: duckduckgo_html
+      DDGS_BACKEND: duckduckgo
+
+      # Required. The server refuses to start without a real random token and
+      # rejects known placeholders at boot, so provide your own:
+      #   MCP_AUTH_TOKEN=$(openssl rand -hex 32) docker compose up -d
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?set MCP_AUTH_TOKEN to a strong random token}
+
+      # Cache pruning defaults for long-running deployments.
+      CACHE_PRUNE_ON_START: "true"
+      CACHE_PRUNE_INTERVAL_SECONDS: "3600"
+      CACHE_MAX_AGE_SECONDS: "604800"
+      CACHE_MAX_SIZE_MB: "512"
+
+      # Optional: host/origin allowlists for FastMCP DNS rebinding protection.
+      # The server defaults to "*" for flexible LAN, tunnel, and reverse-proxy use.
+      # Use comma-separated values for stricter deployments.
+      # MCP_ALLOWED_HOSTS: "*"
+      # MCP_ALLOWED_ORIGINS: "*"
+
+      # Optional: cache directory inside the container. The mounted /data volume
+      # persists this path; the image default is /data/cache.
+      # MCP_CACHE_DIR: /data/cache
+
+      # Optional: cache TTLs in seconds.
+      # DDG_CACHE_TTL_SECONDS: "21600"
+      # FETCH_CACHE_TTL_SECONDS: "7200"
+
+      # Optional: network timeouts in seconds.
+      # DDG_TIMEOUT_SECONDS: "15"
+      # FETCH_TIMEOUT_SECONDS: "15"
+
+      # Optional: default deep-search page fetch concurrency, capped at 12.
+      # MAX_CONCURRENCY: "5"
